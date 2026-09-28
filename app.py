@@ -232,21 +232,29 @@ if process_btn:
                 os.remove(tmp_path)
                 
         # Handle Google Drive
-        if drive_url.strip():
-            try:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    if "folder" in drive_url or "drive/folders" in drive_url:
-                        gdown.download_folder(url=drive_url, output=temp_dir, quiet=True)
-                    else:
-                        gdown.download(url=drive_url, output=os.path.join(temp_dir, "drive_file"), quiet=True, fuzzy=True)
+        # -----------------------------------------------------------------------------
+# Updated Google Drive Handling Block inside app.py
+# -----------------------------------------------------------------------------
+if drive_url.strip():
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Check if the URL is a Google Drive folder link
+            if "folders" in drive_url or "drive/folders" in drive_url:
+                gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
+            else:
+                # Handle single file URL download cleanly without invalid parameters
+                target_file_path = os.path.join(temp_dir, "downloaded_file")
+                gdown.download(url=drive_url, output=target_file_path, quiet=True)
+            
+            # Walk through downloaded directory and process supported files
+            for root, _, files in os.walk(temp_dir):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    extracted = process_single_file(fpath, fname)
+                    all_raw_docs.extend(extracted)
                     
-                    for root, _, files in os.walk(temp_dir):
-                        for fname in files:
-                            fpath = os.path.join(root, fname)
-                            extracted = process_single_file(fpath, fname)
-                            all_raw_docs.extend(extracted)
-            except Exception as e:
-                st.error(f"Error downloading from Google Drive: {e}")
+    except Exception as e:
+        st.error(f"Error downloading from Google Drive: {e}")
 
     if all_raw_docs:
         with st.spinner("Chunking & generating embeddings..."):
