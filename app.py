@@ -16,12 +16,21 @@ from groq import Groq
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="AI Multi-Document Assistant", page_icon="📚", layout="wide")
 
+# Custom CSS for Professional UI
+st.markdown("""
+<style>
+    .stApp { background-color: #F8F9FA; }
+    .stButton>button { border-radius: 8px; font-weight: 500; transition: 0.3s; }
+    .stButton>button:hover { border-color: #007BFF; color: #007BFF; }
+    .stFileUploader { padding-bottom: 10px; }
+    div[data-testid="stSidebar"] { background-color: #FFFFFF; border-right: 1px solid #EAEAEA; }
+</style>
+""", unsafe_allow_html=True)
 
 @st.cache_resource
 def load_embedding_model():
     """Cache the embedding model so it's loaded only once per server runtime."""
     return SentenceTransformer("all-MiniLM-L6-v2")
-
 
 embedding_model = load_embedding_model()
 
@@ -34,7 +43,13 @@ if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
 if "suggested_questions" not in st.session_state:
     st.session_state.suggested_questions = []
-
+# New Session State for Chat UI
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "👋 Hello! Please upload your documents from the sidebar to start asking questions."}
+    ]
+if "trigger_query" not in st.session_state:
+    st.session_state.trigger_query = None
 
 # -----------------------------------------------------------------------------
 # Helper: Clear Knowledge Base State
@@ -45,7 +60,9 @@ def reset_knowledge_base():
     st.session_state.faiss_index = None
     st.session_state.embeddings = None
     st.session_state.suggested_questions = []
-
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Knowledge base cleared. Upload new documents to start over!"}
+    ]
 
 # -----------------------------------------------------------------------------
 # 1. Document Extraction Functions
@@ -54,7 +71,6 @@ def extract_txt(file_path: str, filename: str) -> List[Dict[str, Any]]:
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
     return [{"text": text, "filename": filename, "page": "N/A"}] if text.strip() else []
-
 
 def extract_pdf(file_path: str, filename: str) -> List[Dict[str, Any]]:
     documents = []
@@ -68,7 +84,6 @@ def extract_pdf(file_path: str, filename: str) -> List[Dict[str, Any]]:
         pass
     return documents
 
-
 def extract_docx(file_path: str, filename: str) -> List[Dict[str, Any]]:
     try:
         doc = docx.Document(file_path)
@@ -76,7 +91,6 @@ def extract_docx(file_path: str, filename: str) -> List[Dict[str, Any]]:
         return [{"text": text, "filename": filename, "page": "N/A"}] if text.strip() else []
     except Exception:
         return []
-
 
 def process_single_file(file_path: str, filename: str) -> List[Dict[str, Any]]:
     ext = os.path.splitext(filename)[1].lower()
@@ -98,7 +112,6 @@ def process_single_file(file_path: str, filename: str) -> List[Dict[str, Any]]:
         return docx_docs
 
     return extract_txt(file_path, filename)
-
 
 # -----------------------------------------------------------------------------
 # 2. Text Chunking
@@ -123,7 +136,6 @@ def chunk_documents(docs: List[Dict[str, Any]], chunk_size: int = 500, overlap: 
             start += chunk_size - overlap
     return chunks
 
-
 # -----------------------------------------------------------------------------
 # 3. Embedding & FAISS Index Building
 # -----------------------------------------------------------------------------
@@ -142,7 +154,6 @@ def build_vector_store(chunks: List[Dict[str, Any]]):
     st.session_state.embeddings = embeddings
     st.session_state.faiss_index = index
 
-
 # -----------------------------------------------------------------------------
 # 4. Search Mechanisms (Semantic, Keyword, Hybrid)
 # -----------------------------------------------------------------------------
@@ -153,7 +164,6 @@ def semantic_search(query: str, k: int = 10) -> List[Tuple[int, float]]:
     faiss.normalize_L2(query_vector)
     scores, indices = st.session_state.faiss_index.search(query_vector, k)
     return list(zip(indices[0], scores[0]))
-
 
 def keyword_search(query: str) -> Dict[int, float]:
     keywords = set(re.findall(r'\w+', query.lower()))
@@ -170,7 +180,6 @@ def keyword_search(query: str) -> Dict[int, float]:
         if score > 0:
             scores[idx] = score
     return scores
-
 
 def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     if not st.session_state.chunks:
@@ -198,12 +207,10 @@ def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
 
     return retrieved_chunks
 
-
 # -----------------------------------------------------------------------------
 # 5. Groq Integration & Automatic Question Suggestions
 # -----------------------------------------------------------------------------
 def generate_suggested_questions(chunks: List[Dict[str, Any]]) -> List[str]:
-    """Generates 3 practical questions based on representative document chunks."""
     api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key or not chunks:
         return []
@@ -221,7 +228,7 @@ Document Sample:
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="llama-3.1-8b-instant", # Changed model slightly for fast reasoning, change back if needed
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
@@ -230,7 +237,6 @@ Document Sample:
         return questions[:3]
     except Exception:
         return []
-
 
 def answer_question(query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
     api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
@@ -254,14 +260,13 @@ Answer:"""
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="llama-3.1-8b-instant", # Change back to 'openai/gpt-oss-120b' if that is your active Groq model
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
         return response.choices[0].message.content
     except Exception as e:
         return f"Error connecting to Groq API: {str(e)}"
-
 
 # -----------------------------------------------------------------------------
 # 6. Ingestion Helpers
@@ -281,7 +286,6 @@ def ingest_uploaded_files(uploaded_files) -> List[Dict[str, Any]]:
             st.sidebar.warning(f"Could not extract text from local file: {file.name}")
         os.remove(tmp_path)
     return raw_docs
-
 
 def ingest_multiple_drive_links(drive_urls_input: str) -> List[Dict[str, Any]]:
     urls = [url.strip() for url in re.split(r'[\n,\s]+', drive_urls_input) if url.strip()]
@@ -314,97 +318,121 @@ def ingest_multiple_drive_links(drive_urls_input: str) -> List[Dict[str, Any]]:
 
     return raw_docs
 
-
 # -----------------------------------------------------------------------------
-# 7. Streamlit User Interface
+# 7. Streamlit User Interface (UPGRADED)
 # -----------------------------------------------------------------------------
-st.title("📚 AI Document Assistant")
-st.markdown("Upload local documents or paste public Google Drive links to build your knowledge base.")
 
+# --- SIDEBAR UI ---
 with st.sidebar:
-    st.header("1. Upload Local Files")
+    st.image("https://cdn-icons-png.flaticon.com/512/8347/8347446.png", width=60) # Professional Icon
+    st.title("Knowledge Base")
+    st.caption("Upload documents to chat with them.")
+    
+    st.subheader("1. Upload Local Files")
     uploaded_files = st.file_uploader(
-        "Upload PDF, DOCX, TXT, or MD files (Multiple allowed)",
+        "Upload PDF, DOCX, TXT, or MD",
         type=["pdf", "docx", "txt", "md"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        label_visibility="collapsed"
     )
 
-    st.subheader("2. Paste Google Drive Links")
-    st.caption("Paste public file/folder links (one per line or comma-separated).")
-    drive_urls_input = st.text_area("Folder or File Links:", height=120)
+    st.subheader("2. Google Drive Links")
+    drive_urls_input = st.text_area("Paste links (one per line)", height=100)
 
-    process_btn = st.button("Process All Documents", type="primary", use_container_width=True)
-
+    process_btn = st.button("🚀 Process Documents", type="primary", use_container_width=True)
     st.divider()
 
-    # Clear Knowledge Base Button
-    if st.button("🗑️ Clear Knowledge Base", type="secondary", use_container_width=True):
-        reset_knowledge_base()
-        st.success("Knowledge base cleared successfully!")
-        st.rerun()
+    # Active Knowledge Base Status
+    if st.session_state.chunks:
+        st.success(f"🟢 Active: {len(st.session_state.chunks)} text chunks ready.")
+        
+        # Suggested Questions nicely integrated into sidebar
+        if st.session_state.suggested_questions:
+            st.markdown("💡 **Suggested Questions:**")
+            for idx, sq in enumerate(st.session_state.suggested_questions):
+                if st.button(sq, key=f"sq_{idx}", use_container_width=True):
+                    st.session_state.trigger_query = sq # Sets query for chat
+                    st.rerun()
+                    
+        st.divider()
+        if st.button("🗑️ Clear Knowledge Base", type="secondary", use_container_width=True):
+            reset_knowledge_base()
+            st.rerun()
+    else:
+        st.info("🔴 No documents loaded yet.")
 
-# Document Ingestion Processing Workflow
+# Document Ingestion Processing
 if process_btn:
     all_raw_docs = []
-
-    with st.spinner("Extracting text from all documents..."):
+    with st.spinner("Extracting text from documents..."):
         if uploaded_files:
             all_raw_docs.extend(ingest_uploaded_files(uploaded_files))
-
         if drive_urls_input.strip():
             all_raw_docs.extend(ingest_multiple_drive_links(drive_urls_input))
 
     if all_raw_docs:
-        with st.spinner("Chunking & generating vector embeddings..."):
+        with st.spinner("Generating vector embeddings..."):
             chunks = chunk_documents(all_raw_docs)
             if chunks:
                 build_vector_store(chunks)
                 st.session_state.suggested_questions = generate_suggested_questions(chunks)
-                st.sidebar.success(
-                    f"Success! Processed {len(all_raw_docs)} document section(s) into {len(chunks)} searchable chunks."
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": f"✅ Successfully processed {len(all_raw_docs)} document(s) into {len(chunks)} chunks. What would you like to know?"}
                 )
+                st.rerun()
             else:
                 st.sidebar.warning("Text extracted, but resulted in 0 chunks.")
     else:
-        st.sidebar.error("No valid text extracted. Please check your files or Google Drive permissions.")
+        st.sidebar.error("No valid text extracted. Check files or permissions.")
 
-# Question Answering Interface
+# --- MAIN CHAT UI ---
+st.title("📚 AI Document Assistant")
+st.markdown("Ask anything based on the uploaded documents. The AI will retrieve the exact context and answer.")
 st.divider()
-if st.session_state.chunks:
-    st.info(f"🟢 Knowledge Base Active: **{len(st.session_state.chunks)} text chunks** ready across all loaded documents.")
 
-    selected_query = ""
+# Display Chat History
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        
+        # Display Sources in an elegant expander if they exist
+        if "sources" in msg and msg["sources"]:
+            with st.expander("🔍 View Retrieved Sources"):
+                for idx, chunk in enumerate(msg["sources"]):
+                    st.markdown(f"**Source {idx + 1} | {chunk['filename']} (Page: {chunk['page']})**")
+                    st.caption(f"Relevance Score: {chunk['score']:.2f}")
+                    st.write(chunk["text"])
+                    st.divider()
 
-    # Display Suggested Quick Questions if available
-    if st.session_state.suggested_questions:
-        st.subheader("💡 Suggested Quick Questions")
-        options = ["-- Select a suggested question --"] + st.session_state.suggested_questions + ["Type my own question..."]
-        chosen_option = st.selectbox("Pick an AI-suggested question or select custom input:", options)
+# Handle User Input (either typed or clicked from suggestions)
+query = st.chat_input("Ask a question about your documents...", disabled=not st.session_state.chunks)
 
-        if chosen_option not in ["-- Select a suggested question --", "Type my own question..."]:
-            selected_query = chosen_option
+# Override with suggested question if clicked from sidebar
+if st.session_state.trigger_query:
+    query = st.session_state.trigger_query
+    st.session_state.trigger_query = None
 
-    # Show custom text input box if selected or no quick questions exist
-    if not selected_query:
-        query_input = st.text_input("Ask a question about your documents:")
-        if query_input.strip():
-            selected_query = query_input
+if query:
+    # 1. Show user message
+    st.chat_message("user").markdown(query)
+    st.session_state.messages.append({"role": "user", "content": query})
 
-    # Execute Hybrid RAG Search and LLM Answer
-    if selected_query:
-        with st.spinner("Searching across documents and generating answer..."):
-            retrieved = hybrid_search(selected_query, top_k=5)
-            answer = answer_question(selected_query, retrieved)
+    # 2. Show assistant response with spinner
+    with st.chat_message("assistant"):
+        with st.spinner("Searching documents & generating answer..."):
+            retrieved = hybrid_search(query, top_k=5)
+            answer = answer_question(query, retrieved)
 
-        st.subheader("Answer")
-        st.write(answer)
+        st.markdown(answer)
+        
+        # Show sources below answer live
+        if retrieved:
+            with st.expander("🔍 View Retrieved Sources"):
+                for idx, chunk in enumerate(retrieved):
+                    st.markdown(f"**Source {idx + 1} | {chunk['filename']} (Page: {chunk['page']})**")
+                    st.caption(f"Relevance Score: {chunk['score']:.2f}")
+                    st.write(chunk["text"])
+                    st.divider()
 
-        st.divider()
-        st.subheader("Retrieved Sources")
-        for idx, chunk in enumerate(retrieved):
-            with st.expander(
-                f"Source {idx + 1}: {chunk['filename']} (Page: {chunk['page']}) | Relevance Score: {chunk['score']:.2f}"
-            ):
-                st.write(chunk["text"])
-else:
-    st.info("👆 Upload files or paste Google Drive links in the sidebar to begin.")
+        # Save to history
+        st.session_state.messages.append({"role": "assistant", "content": answer, "sources": retrieved})
