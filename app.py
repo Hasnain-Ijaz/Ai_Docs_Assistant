@@ -14,12 +14,12 @@ from groq import Groq
 # -----------------------------------------------------------------------------
 # Configuration & Setup
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="AI Document Assistant", page_icon="📚", layout="wide")
+st.set_page_config(page_title="AI Multi-Document Assistant", page_icon="📚", layout="wide")
 
 
 @st.cache_resource
 def load_embedding_model():
-    """Cache the embedding model so it's loaded only once."""
+    """Cache the embedding model so it's loaded only once per server runtime."""
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
@@ -32,6 +32,19 @@ if "faiss_index" not in st.session_state:
     st.session_state.faiss_index = None
 if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
+if "suggested_questions" not in st.session_state:
+    st.session_state.suggested_questions = []
+
+
+# -----------------------------------------------------------------------------
+# Helper: Clear Knowledge Base State
+# -----------------------------------------------------------------------------
+def reset_knowledge_base():
+    """Resets vector index, stored chunks, embeddings, and suggested questions."""
+    st.session_state.chunks = []
+    st.session_state.faiss_index = None
+    st.session_state.embeddings = None
+    st.session_state.suggested_questions = []
 
 
 # -----------------------------------------------------------------------------
@@ -40,34 +53,51 @@ if "embeddings" not in st.session_state:
 def extract_txt(file_path: str, filename: str) -> List[Dict[str, Any]]:
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
-    return [{"text": text, "filename": filename, "page": "N/A"}]
+    return [{"text": text, "filename": filename, "page": "N/A"}] if text.strip() else []
 
 
 def extract_pdf(file_path: str, filename: str) -> List[Dict[str, Any]]:
     documents = []
-    reader = pypdf.PdfReader(file_path)
-    for idx, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        if text.strip():
-            documents.append({"text": text, "filename": filename, "page": idx + 1})
+    try:
+        reader = pypdf.PdfReader(file_path)
+        for idx, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                documents.append({"text": text, "filename": filename, "page": idx + 1})
+    except Exception:
+        pass
     return documents
 
 
 def extract_docx(file_path: str, filename: str) -> List[Dict[str, Any]]:
-    doc = docx.Document(file_path)
-    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    return [{"text": text, "filename": filename, "page": "N/A"}]
+    try:
+        doc = docx.Document(file_path)
+        text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        return [{"text": text, "filename": filename, "page": "N/A"}] if text.strip() else []
+    except Exception:
+        return []
 
 
 def process_single_file(file_path: str, filename: str) -> List[Dict[str, Any]]:
     ext = os.path.splitext(filename)[1].lower()
+
     if ext in [".txt", ".md"]:
         return extract_txt(file_path, filename)
     elif ext == ".pdf":
         return extract_pdf(file_path, filename)
     elif ext == ".docx":
         return extract_docx(file_path, filename)
-    return []
+
+    # Fallback auto-detection for missing or unknown extensions
+    pdf_docs = extract_pdf(file_path, filename)
+    if pdf_docs:
+        return pdf_docs
+
+    docx_docs = extract_docx(file_path, filename)
+    if docx_docs:
+        return docx_docs
+
+    return extract_txt(file_path, filename)
 
 
 # -----------------------------------------------------------------------------
@@ -114,7 +144,7 @@ def build_vector_store(chunks: List[Dict[str, Any]]):
 
 
 # -----------------------------------------------------------------------------
-# 4. Search Mechanisms
+# 4. Search Mechanisms (Semantic, Keyword, Hybrid)
 # -----------------------------------------------------------------------------
 def semantic_search(query: str, k: int = 10) -> List[Tuple[int, float]]:
     if st.session_state.faiss_index is None:
@@ -142,7 +172,7 @@ def keyword_search(query: str) -> Dict[int, float]:
     return scores
 
 
-def hybrid_search(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
+def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     if not st.session_state.chunks:
         return []
 
@@ -170,12 +200,42 @@ def hybrid_search(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# 5. Groq Integration
+# 5. Groq Integration & Automatic Question Suggestions
 # -----------------------------------------------------------------------------
+def generate_suggested_questions(chunks: List[Dict[str, Any]]) -> List[str]:
+    """Generates 3 practical questions based on representative document chunks."""
+    api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    if not api_key or not chunks:
+        return []
+
+    step = max(1, len(chunks) // 5)
+    sample_chunks = chunks[::step][:5]
+    sample_text = "\n\n".join([c["text"] for c in sample_chunks])
+
+    prompt = f"""Based on the following document excerpts, generate 3 clear, concise, and practical questions that a user might ask about this text.
+Return ONLY the 3 questions as a numbered list (1., 2., 3.). Do not include any introductory or concluding text.
+
+Document Sample:
+{sample_text}"""
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        lines = response.choices[0].message.content.strip().split("\n")
+        questions = [re.sub(r'^\d+\.\s*', '', line).strip() for line in lines if line.strip()]
+        return questions[:3]
+    except Exception:
+        return []
+
+
 def answer_question(query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
     api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return "⚠️ GROQ_API_KEY is missing. Please configure `.streamlit/secrets.toml` or set it in Streamlit Cloud secrets."
+        return "⚠️ GROQ_API_KEY is missing. Please configure `.streamlit/secrets.toml` or set it in your environment variables."
 
     client = Groq(api_key=api_key)
     context_str = "\n\n".join(
@@ -218,36 +278,39 @@ def ingest_uploaded_files(uploaded_files) -> List[Dict[str, Any]]:
         if extracted:
             raw_docs.extend(extracted)
         else:
-            st.sidebar.warning(f"Could not extract text from: {file.name}")
+            st.sidebar.warning(f"Could not extract text from local file: {file.name}")
         os.remove(tmp_path)
     return raw_docs
 
 
-def ingest_google_drive_link(drive_url: str) -> List[Dict[str, Any]]:
+def ingest_multiple_drive_links(drive_urls_input: str) -> List[Dict[str, Any]]:
+    urls = [url.strip() for url in re.split(r'[\n,\s]+', drive_urls_input) if url.strip()]
     raw_docs = []
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            if "folders" in drive_url or "drive/folders" in drive_url:
-                gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
-            else:
-                target_path = os.path.join(temp_dir, "drive_file")
-                gdown.download(url=drive_url, output=target_path, quiet=True)
 
-            found_any = False
-            for root, _, files in os.walk(temp_dir):
-                for fname in files:
-                    found_any = True
-                    fpath = os.path.join(root, fname)
-                    extracted = process_single_file(fpath, fname)
-                    if extracted:
-                        raw_docs.extend(extracted)
-                    else:
-                        st.sidebar.warning(f"Skipped unsupported/empty file: {fname}")
+    for idx, drive_url in enumerate(urls):
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                if "folders" in drive_url or "drive/folders" in drive_url:
+                    gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
+                else:
+                    downloaded_file = gdown.download(url=drive_url, output=os.path.join(temp_dir, ""), quiet=True)
+                    if not downloaded_file:
+                        fallback_path = os.path.join(temp_dir, f"drive_doc_{idx}")
+                        gdown.download(url=drive_url, output=fallback_path, quiet=True)
 
-            if not found_any:
-                st.sidebar.error("No files could be downloaded from the Google Drive link.")
-    except Exception as e:
-        st.sidebar.error(f"Error accessing Google Drive link: {e}")
+                found_any = False
+                for root, _, files in os.walk(temp_dir):
+                    for fname in files:
+                        found_any = True
+                        fpath = os.path.join(root, fname)
+                        extracted = process_single_file(fpath, fname)
+                        if extracted:
+                            raw_docs.extend(extracted)
+
+                if not found_any:
+                    st.sidebar.warning(f"Link #{idx+1}: No downloadable files found.")
+        except Exception as e:
+            st.sidebar.error(f"Link #{idx+1} Error: {e}")
 
     return raw_docs
 
@@ -256,55 +319,82 @@ def ingest_google_drive_link(drive_url: str) -> List[Dict[str, Any]]:
 # 7. Streamlit User Interface
 # -----------------------------------------------------------------------------
 st.title("📚 AI Document Assistant")
-st.markdown("Upload documents locally or import from Google Drive to chat with your knowledge base.")
+st.markdown("Upload local documents or paste public Google Drive links to build your knowledge base.")
 
 with st.sidebar:
-    st.header("1. Add Documents")
+    st.header("1. Upload Local Files")
     uploaded_files = st.file_uploader(
-        "Upload PDF, DOCX, TXT, or MD files",
+        "Upload PDF, DOCX, TXT, or MD files (Multiple allowed)",
         type=["pdf", "docx", "txt", "md"],
         accept_multiple_files=True
     )
 
-    st.subheader("Or Google Drive Link")
-    st.caption("⚠️ Link access MUST be set to 'Anyone with the link can view'")
-    drive_url = st.text_input("Folder or File Link:")
-    process_btn = st.button("Process Documents", type="primary")
+    st.subheader("2. Paste Google Drive Links")
+    st.caption("Paste public file/folder links (one per line or comma-separated).")
+    drive_urls_input = st.text_area("Folder or File Links:", height=120)
 
-# Document Ingestion Processing
+    process_btn = st.button("Process All Documents", type="primary", use_container_width=True)
+
+    st.divider()
+
+    # Clear Knowledge Base Button
+    if st.button("🗑️ Clear Knowledge Base", type="secondary", use_container_width=True):
+        reset_knowledge_base()
+        st.success("Knowledge base cleared successfully!")
+        st.rerun()
+
+# Document Ingestion Processing Workflow
 if process_btn:
     all_raw_docs = []
 
-    with st.spinner("Extracting text from documents..."):
+    with st.spinner("Extracting text from all documents..."):
         if uploaded_files:
             all_raw_docs.extend(ingest_uploaded_files(uploaded_files))
 
-        if drive_url.strip():
-            all_raw_docs.extend(ingest_google_drive_link(drive_url))
+        if drive_urls_input.strip():
+            all_raw_docs.extend(ingest_multiple_drive_links(drive_urls_input))
 
     if all_raw_docs:
-        with st.spinner("Chunking & generating embeddings..."):
+        with st.spinner("Chunking & generating vector embeddings..."):
             chunks = chunk_documents(all_raw_docs)
             if chunks:
                 build_vector_store(chunks)
+                st.session_state.suggested_questions = generate_suggested_questions(chunks)
                 st.sidebar.success(
-                    f"Success! Embedded {len(all_raw_docs)} document section(s) into {len(chunks)} chunks."
+                    f"Success! Processed {len(all_raw_docs)} document section(s) into {len(chunks)} searchable chunks."
                 )
             else:
-                st.sidebar.warning("Text was extracted, but resulted in 0 chunks.")
+                st.sidebar.warning("Text extracted, but resulted in 0 chunks.")
     else:
-        st.sidebar.error("No valid text extracted. Please verify file content and Google Drive permissions.")
+        st.sidebar.error("No valid text extracted. Please check your files or Google Drive permissions.")
 
 # Question Answering Interface
 st.divider()
 if st.session_state.chunks:
-    st.info(f"🟢 Knowledge Base Active: **{len(st.session_state.chunks)} text chunks** ready.")
-    query = st.text_input("Ask a question about your documents:")
+    st.info(f"🟢 Knowledge Base Active: **{len(st.session_state.chunks)} text chunks** ready across all loaded documents.")
 
-    if query.strip():
-        with st.spinner("Searching and generating answer..."):
-            retrieved = hybrid_search(query, top_k=4)
-            answer = answer_question(query, retrieved)
+    selected_query = ""
+
+    # Display Suggested Quick Questions if available
+    if st.session_state.suggested_questions:
+        st.subheader("💡 Suggested Quick Questions")
+        options = ["-- Select a suggested question --"] + st.session_state.suggested_questions + ["Type my own question..."]
+        chosen_option = st.selectbox("Pick an AI-suggested question or select custom input:", options)
+
+        if chosen_option not in ["-- Select a suggested question --", "Type my own question..."]:
+            selected_query = chosen_option
+
+    # Show custom text input box if selected or no quick questions exist
+    if not selected_query:
+        query_input = st.text_input("Ask a question about your documents:")
+        if query_input.strip():
+            selected_query = query_input
+
+    # Execute Hybrid RAG Search and LLM Answer
+    if selected_query:
+        with st.spinner("Searching across documents and generating answer..."):
+            retrieved = hybrid_search(selected_query, top_k=5)
+            answer = answer_question(selected_query, retrieved)
 
         st.subheader("Answer")
         st.write(answer)
@@ -317,4 +407,4 @@ if st.session_state.chunks:
             ):
                 st.write(chunk["text"])
 else:
-    st.info("👆 Please upload files or provide a Google Drive link in the sidebar to get started.")
+    st.info("👆 Upload files or paste Google Drive links in the sidebar to begin.")
