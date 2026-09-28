@@ -228,7 +228,7 @@ Document Sample:
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant", # Changed model slightly for fast reasoning, change back if needed
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
@@ -260,7 +260,7 @@ Answer:"""
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant", # Change back to 'openai/gpt-oss-120b' if that is your active Groq model
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
