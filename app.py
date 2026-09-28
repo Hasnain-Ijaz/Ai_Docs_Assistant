@@ -196,6 +196,9 @@ Answer:"""
 st.title("📚 AI Document Assistant")
 st.markdown("Upload documents locally or import from Google Drive to chat with your knowledge base.")
 
+# -----------------------------------------------------------------------------
+# Updated Streamlit UI & Document Ingestion
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("1. Add Documents")
     uploaded_files = st.file_uploader(
@@ -205,50 +208,80 @@ with st.sidebar:
     )
     
     st.subheader("Or Google Drive Link")
+    st.caption("⚠️ File/Folder MUST be set to 'Anyone with the link can view'")
     drive_url = st.text_input("Folder or File Link:")
     process_btn = st.button("Process Documents", type="primary")
 
-# PROPERLY SCOPED PROCESSING BLOCK
+# Robust Document Processing Workflow
 if process_btn:
     all_raw_docs = []
     
     with st.spinner("Extracting text from documents..."):
-        # Local Uploads
+        # 1. Process Local Uploads
         if uploaded_files:
             for file in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
+                ext = os.path.splitext(file.name)[1].lower()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                     tmp.write(file.getvalue())
                     tmp_path = tmp.name
+                
                 extracted = process_single_file(tmp_path, file.name)
-                all_raw_docs.extend(extracted)
+                if extracted:
+                    all_raw_docs.extend(extracted)
+                else:
+                    st.sidebar.warning(f"Could not extract text from: {file.name}")
                 os.remove(tmp_path)
                 
-        # Google Drive Links
+        # 2. Process Google Drive Link
         if drive_url.strip():
             try:
                 with tempfile.TemporaryDirectory() as temp_dir:
+                    # Case A: Google Drive Folder
                     if "folders" in drive_url or "drive/folders" in drive_url:
-                        gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
+                        downloaded_files = gdown.download_folder(
+                            url=drive_url, 
+                            output=temp_dir, 
+                            quiet=True, 
+                            remaining_ok=True
+                        )
+                    # Case B: Single File (Shared Link, Google Doc, PDF, etc.)
                     else:
-                        target_file_path = os.path.join(temp_dir, "downloaded_file")
-                        gdown.download(url=drive_url, output=target_file_path, quiet=True)
+                        downloaded_path = gdown.download(
+                            url=drive_url, 
+                            output=os.path.join(temp_dir, ""), 
+                            quiet=True, 
+                            fuzzy=True
+                        )
                     
+                    # Inspect temp directory for downloaded files
+                    found_any = False
                     for root, _, files in os.walk(temp_dir):
                         for fname in files:
+                            found_any = True
                             fpath = os.path.join(root, fname)
                             extracted = process_single_file(fpath, fname)
-                            all_raw_docs.extend(extracted)
-            except Exception as e:
-                st.sidebar.error(f"Error downloading from Google Drive: {e}")
+                            if extracted:
+                                all_raw_docs.extend(extracted)
+                            else:
+                                st.sidebar.warning(f"Skipped unsupported or empty file: {fname}")
+                    
+                    if not found_any:
+                        st.sidebar.error("Google Drive link was downloaded, but no files were found inside.")
 
-    # Checked inside the process_btn block
+            except Exception as e:
+                st.sidebar.error(f"Error accessing Google Drive link: {e}")
+
+    # 3. Vectorization Check
     if all_raw_docs:
         with st.spinner("Chunking & generating embeddings..."):
             chunks = chunk_documents(all_raw_docs)
-            build_vector_store(chunks)
-            st.sidebar.success(f"Processed {len(all_raw_docs)} document section(s) into {len(chunks)} chunks!")
+            if chunks:
+                build_vector_store(chunks)
+                st.sidebar.success(f"Success! Embedded {len(all_raw_docs)} document section(s) into {len(chunks)} chunks.")
+            else:
+                st.sidebar.warning("Text extracted, but resulted in 0 chunks. Try adjusting chunk size.")
     else:
-        st.sidebar.warning("No valid text extracted. Please check your files/links.")
+        st.sidebar.error("No valid text extracted. Please check file formats or Google Drive permissions.")
 
 # Question Answering Interface
 st.divider()
