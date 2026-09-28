@@ -25,7 +25,7 @@ embedding_model = load_embedding_model()
 
 # Initialize Session State
 if "chunks" not in st.session_state:
-    st.session_state.chunks = []  # List of dicts: {"text": str, "filename": str, "page": int/str}
+    st.session_state.chunks = []
 if "faiss_index" not in st.session_state:
     st.session_state.faiss_index = None
 if "embeddings" not in st.session_state:
@@ -95,7 +95,6 @@ def build_vector_store(chunks: List[Dict[str, Any]]):
     texts = [c["text"] for c in chunks]
     embeddings = embedding_model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
     
-    # Normalize for cosine similarity via inner product
     faiss.normalize_L2(embeddings)
     dimension = embeddings.shape[1]
     index = faiss.IndexFlatIP(dimension)
@@ -106,7 +105,7 @@ def build_vector_store(chunks: List[Dict[str, Any]]):
     st.session_state.faiss_index = index
 
 # -----------------------------------------------------------------------------
-# 4. Search Mechanisms (Semantic, Keyword, Hybrid)
+# 4. Search Mechanisms
 # -----------------------------------------------------------------------------
 def semantic_search(query: str, k: int = 10) -> List[Tuple[int, float]]:
     if st.session_state.faiss_index is None:
@@ -117,7 +116,6 @@ def semantic_search(query: str, k: int = 10) -> List[Tuple[int, float]]:
     return list(zip(indices[0], scores[0]))
 
 def keyword_search(query: str) -> Dict[int, float]:
-    """Simple keyword frequency-based scoring over all chunks."""
     keywords = set(re.findall(r'\w+', query.lower()))
     if not keywords:
         return {}
@@ -128,7 +126,7 @@ def keyword_search(query: str) -> Dict[int, float]:
         if not text_words:
             continue
         matches = sum(1 for word in text_words if word in keywords)
-        score = matches / len(text_words)  # Keyword density score
+        score = matches / len(text_words)
         if score > 0:
             scores[idx] = score
     return scores
@@ -140,7 +138,6 @@ def hybrid_search(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
     sem_results = dict(semantic_search(query, k=min(20, len(st.session_state.chunks))))
     kw_results = keyword_search(query)
     
-    # Combine scores (normalize keyword scores to 0-1 range first if any exist)
     combined_scores = {}
     max_kw = max(kw_results.values()) if kw_results else 1.0
     
@@ -148,10 +145,8 @@ def hybrid_search(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
     for idx in all_indices:
         sem_score = sem_results.get(idx, 0.0)
         kw_score = (kw_results.get(idx, 0.0) / max_kw) if max_kw > 0 else 0.0
-        # Weighted hybrid score: 70% Semantic + 30% Keyword
         combined_scores[idx] = (0.7 * sem_score) + (0.3 * kw_score)
     
-    # Sort by hybrid score descending
     sorted_indices = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
     
     retrieved_chunks = []
@@ -168,7 +163,7 @@ def hybrid_search(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
 def answer_question(query: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
     api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return "⚠️ GROQ_API_KEY is missing. Please configure `.streamlit/secrets.toml` or set it as an environment variable."
+        return "⚠️ GROQ_API_KEY is missing. Please configure `.streamlit/secrets.toml` or set it in Streamlit Cloud secrets."
     
     client = Groq(api_key=api_key)
     context_str = "\n\n".join(
@@ -187,7 +182,7 @@ Answer:"""
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
@@ -203,25 +198,22 @@ st.markdown("Upload documents locally or import from Google Drive to chat with y
 
 with st.sidebar:
     st.header("1. Add Documents")
-    
-    # Local File Upload
     uploaded_files = st.file_uploader(
         "Upload PDF, DOCX, TXT, or MD files", 
         type=["pdf", "docx", "txt", "md"], 
         accept_multiple_files=True
     )
     
-    # Google Drive Integration
     st.subheader("Or Google Drive Link")
     drive_url = st.text_input("Folder or File Link:")
-    
     process_btn = st.button("Process Documents", type="primary")
 
-# Document Processing Flow
+# PROPERLY SCOPED PROCESSING BLOCK
 if process_btn:
     all_raw_docs = []
+    
     with st.spinner("Extracting text from documents..."):
-        # Handle local files
+        # Local Uploads
         if uploaded_files:
             for file in uploaded_files:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
@@ -231,36 +223,30 @@ if process_btn:
                 all_raw_docs.extend(extracted)
                 os.remove(tmp_path)
                 
-        # Handle Google Drive
-        # -----------------------------------------------------------------------------
-# Updated Google Drive Handling Block inside app.py
-# -----------------------------------------------------------------------------
-if drive_url.strip():
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Check if the URL is a Google Drive folder link
-            if "folders" in drive_url or "drive/folders" in drive_url:
-                gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
-            else:
-                # Handle single file URL download cleanly without invalid parameters
-                target_file_path = os.path.join(temp_dir, "downloaded_file")
-                gdown.download(url=drive_url, output=target_file_path, quiet=True)
-            
-            # Walk through downloaded directory and process supported files
-            for root, _, files in os.walk(temp_dir):
-                for fname in files:
-                    fpath = os.path.join(root, fname)
-                    extracted = process_single_file(fpath, fname)
-                    all_raw_docs.extend(extracted)
+        # Google Drive Links
+        if drive_url.strip():
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    if "folders" in drive_url or "drive/folders" in drive_url:
+                        gdown.download_folder(url=drive_url, output=temp_dir, quiet=True, remaining_ok=True)
+                    else:
+                        target_file_path = os.path.join(temp_dir, "downloaded_file")
+                        gdown.download(url=drive_url, output=target_file_path, quiet=True)
                     
-    except Exception as e:
-        st.error(f"Error downloading from Google Drive: {e}")
+                    for root, _, files in os.walk(temp_dir):
+                        for fname in files:
+                            fpath = os.path.join(root, fname)
+                            extracted = process_single_file(fpath, fname)
+                            all_raw_docs.extend(extracted)
+            except Exception as e:
+                st.sidebar.error(f"Error downloading from Google Drive: {e}")
 
+    # Checked inside the process_btn block
     if all_raw_docs:
         with st.spinner("Chunking & generating embeddings..."):
             chunks = chunk_documents(all_raw_docs)
             build_vector_store(chunks)
-            st.sidebar.success(f"Successfully processed {len(all_raw_docs)} doc section(s) into {len(chunks)} chunks!")
+            st.sidebar.success(f"Processed {len(all_raw_docs)} document section(s) into {len(chunks)} chunks!")
     else:
         st.sidebar.warning("No valid text extracted. Please check your files/links.")
 
